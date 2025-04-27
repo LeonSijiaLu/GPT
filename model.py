@@ -27,6 +27,29 @@ class GPT(nn.Module):
         # hidden layer --> vocab_size, with no bias
         # this is the final stage before softmax, the output is logits
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+        
+        # "weight sharing", meaning certain parameters are shared between components
+        # the motivation is similar tokens should have similar embeddings, it should enhance generic, 
+        # efficiency (removed tons of parameters), and stability
+        # 
+        # self.transformer.wte.weight: (Token --> Embedding)
+        # self.lm_head.weight: (Embedding --> Token)
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        # initialize weights
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm): # redundant
+            torch.nn.init.ones_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
 
     def forward(self, idx, target = None):
         # idx and target both are (B, T)
