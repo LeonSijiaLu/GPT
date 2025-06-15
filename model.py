@@ -6,9 +6,9 @@ from torch.nn import functional as F
 from dataclasses import dataclass
 
 @dataclass
-class GPTConfig:
+class GPTConfig: # 124M parameters
     seq_size: int = 1024 # sequence size
-    vocab_size: int = 50257
+    vocab_size: int = 50304 # 50257 -> 50304 for nicer numbers
     n_layer: int = 12 # number of hidden layers
     n_head: int = 12 # number of heads
     n_embed: int = 768
@@ -41,7 +41,12 @@ class GPT(nn.Module):
         
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if hasattr(module, "RESIDUAL_PATH_INIT"): 
+                # special init for residual path, 
+                # multiply 2 as two blocks do residual pathways, so variance increased by 2 each layer
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 * (2 * self.config.n_layer ** -0.5))
+            else:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -76,6 +81,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x) # (B, T, vocab_size)
         
         # calculate loss
+        # cross_entropy((B * T, vocab_size), (B * T,))
         loss = None
         if target is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
@@ -165,6 +171,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed)
+        self.c_proj.RESIDUAL_PATH_INIT = True
         
         # using tanh in self.gelu is a legacy issue, just following gpt-2's initial design
         # gelu is smoother than relu at position 0, better at avoiding gradient vanishing
@@ -195,6 +202,7 @@ class MultiHeadAttention(nn.Module):
 
         # output projection
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+        self.c_proj.RESIDUAL_PATH_INIT = True
 
         # mask, but following openai's naming
         self.register_buffer("bias", torch.tril(torch.ones(config.seq_size, config.seq_size))
@@ -216,11 +224,18 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1, 2) # (B, self.n_head, T, C // self.n_head)
         v = v.transpose(1, 2)
 
-        attn = (q @ k.transpose(2, 3)) * (1.0 / math.sqrt(k.size(-1))) # (B, self.n_head, T, T)
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf")) # ensures tokens interact only with old tokens
-        attn = F.softmax(attn, dim=-1) # normalizes the attention, probability sums to 1
-
-        y = attn @ v # (B, self.n_head, T, C // self.n_head), weighted sum of tokens we found interesting
+        # REGULAR ATTENTION, 
+        # it requires read and write to the entire NxN attention matrix, and doesn't optimize memory access
+        #
+        # attn = (q @ k.transpose(2, 3)) * (1.0 / math.sqrt(k.size(-1))) # (B, self.n_head, T, T)
+        # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf")) # ensures tokens interact only with old tokens
+        # attn = F.softmax(attn, dim=-1) # normalizes the attention, probability sums to 1
+        # y = attn @ v # (B, self.n_head, T, C // self.n_head), weighted sum of tokens we found interesting
+        #
+        # FLASH ATTENTION,
+        # flash attention optimizes memory access, it costs more flops but significantly faster
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous() # (B, T, self.n_head, C // self.n_head)
         y = y.view(B, T, C) # (B, T, C)
         

@@ -1,7 +1,9 @@
 import os
 import tiktoken
 import torch
+import time
 
+from loader import DataLoader
 from model import GPT, GPTConfig
 from torch.nn import functional as F
 
@@ -13,36 +15,64 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 
 print(f"using device: {device}")
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+    
+# sets the precision used for matrix multiplication,
+# default is "highest", "high" is less precision, but good enough
+torch.set_float32_matmul_precision("high")
+
+data_dir = os.path.join('data', "tinyshakespeare", "tinyshakespeare.txt")
+
 num_return_sequences = 5
 max_tokens = 30
-
 enc = tiktoken.get_encoding("gpt2")
 
-tokens = enc.encode("Hello, I am a language model")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.squeeze(0).repeat(num_return_sequences, 1)
+# tokens = enc.encode("Hello, I am a language model")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.squeeze(0).repeat(num_return_sequences, 1)
 
-# data_dir = os.path.join('data', "tinyshakespeare", "tinyshakespeare.txt")
-# with open(data_dir, 'r', encoding='utf-8') as f:
-#     shakespeare_text = f.read()
-# tokens = enc.encode(shakespeare_text)
-# buf = torch.tensor(tokens[:4 * 32 + 1])
-# x = buf[:-1].view(4, 32).to(device=device)
-# y = buf[1:].view(4, 32).to(device=device)
-
-# print(x.size(), y.size())
-
-
-x = tokens.to(device=device)
-
-model = GPT.from_pretrained("gpt2")
+model = GPT(GPTConfig())
+model.to(device=device)
+# model = torch.compile(model)
 print("worked!")
 
-model.eval()
-model.to(device=device)
+train_loader = DataLoader(B=8, T=512, file_path=data_dir)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, 
+                              betas=[0.9, 0.95], eps=1e-8) # GPT-3 paper
+
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.get_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+
+    # bfloat16 and tf32 has the same range, just different precision
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+        
+    loss.backward()
+    
+    
+    
+    optimizer.step() # update parameters, decrease loss
+    torch.cuda.synchronize() # gpu operations are async
+    
+    # to clip the global norm of the gradient at 1.0
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # GPT-3 Paper
+    
+    t1 = time.time()
+    diff = t1 - t0
+    dt = diff * 1000
+    
+    tokens_per_sec = (train_loader.B + train_loader.T) / diff
+
+    print(f"step {i}, loss: {loss.item():.6f}, norm: {norm:.4f}, dt:{dt:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
+
+
+import sys; sys.exit(0)
 
 while x.size()[1] < max_tokens:
     with torch.no_grad():
