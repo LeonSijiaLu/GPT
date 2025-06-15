@@ -1,6 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
-import math
+import inspect
 
 from torch.nn import functional as F
 from dataclasses import dataclass
@@ -140,6 +142,31 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # we only weight decay parameters with 2 or 2+ dimensions
+        
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+    
+        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+        non_decay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+        
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_non_decay_params = sum(p.numel() for p in non_decay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(non_decay_params)}, with {num_non_decay_params:,} parameters")
+        
+        optim_group = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': non_decay_params, 'weight_decay': 0.0}
+        ]
+        
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        
+        optimizer = torch.optim.AdamW(optim_group, lr=learning_rate, 
+                                      betas=[0.9, 0.95], eps=1e-8, fused=use_fused)
+        return optimizer
 
 class Block(nn.Module):
     def __init__(self, config):
