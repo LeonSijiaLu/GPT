@@ -24,12 +24,18 @@ if torch.cuda.is_available():
 # default is "highest", "high" is less precision, but good enough
 torch.set_float32_matmul_precision("high")
 
-data_dir = os.path.join('data', "tinyshakespeare", "tinyshakespeare.txt")
-
 num_return_sequences = 5
 max_tokens = 30
 max_steps = 50
 enc = tiktoken.get_encoding("gpt2")
+
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 8
+T = 512
+assert total_batch_size % (B * T) == 0, "ensure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size {total_batch_size}")
+print(f"==> calculated gradient accumulation steps: {grad_accum_steps}")
 
 # tokens = enc.encode("Hello, I am a language model")
 # tokens = torch.tensor(tokens, dtype=torch.long)
@@ -40,7 +46,9 @@ model.to(device=device)
 # model = torch.compile(model)
 print("worked!")
 
-train_loader = DataLoader(B=8, T=512, file_path=data_dir)
+data_dir = os.path.join('data', "tinyshakespeare", "tinyshakespeare.txt")
+
+train_loader = DataLoader(B=B, T=T, file_path=data_dir)
 
 lr_scheduler = LRScheduler(max_lr=3e-4, min_lr=3e-4 * 0.1, warmup_steps=10, max_steps=50)
 
@@ -48,14 +56,19 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for i in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.get_batch()
-    x, y = x.to(device), y.to(device)
+    loss_accum = 0.0
     optimizer.zero_grad()
 
-    # bfloat16 and tf32 has the same range, just different precision
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    for ms in range(grad_accum_steps): # gradient accumulation
+        x, y = train_loader.get_batch()
+        x, y = x.to(device), y.to(device)
+
+        # bfloat16 and tf32 has the same range, just different precision
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps # scaling down to match `reduction`, there is a `mean` in loss function
+        loss_accum += loss.detach()
+        loss.backward()
     
     # to clip the global norm of the gradient at 1.0
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # GPT-3 Paper
@@ -70,9 +83,10 @@ for i in range(max_steps):
     
     t1 = time.time()
     dts = t1 - t0
-    tokens_per_sec = (train_loader.B * train_loader.T) / dts
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dts
 
-    print(f"step {i}, loss: {loss.item():.6f}, lr: {lr:.4e}, norm: {norm:.4f}, dt:{dts * 1000:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
+    print(f"step {i}, loss: {loss_accum.item():.6f}, lr: {lr:.4e}, norm: {norm:.4f}, dt:{dts * 1000:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
 
 
 import sys; sys.exit(0)
