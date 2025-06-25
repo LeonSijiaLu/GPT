@@ -8,13 +8,34 @@ from model import GPT, GPTConfig
 from lr_scheduler import LRScheduler
 from torch.nn import functional as F
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 
-print(f"using device: {device}")
+ddp = int(os.environ.get('RANK', -1)) != -1
+print(f"using ddp: {ddp}")
+if ddp:
+    assert torch.cuda.is_available(), "CUDA is required for DDP"
+    init_process_group(backend='nccl')
+    
+    ddp_rank = int(os.environ['RANK']) # global uuid
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) # local uuid
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # number of processes
+    
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device=device)
+    master_process = ddp_rank == 0 # master process will do logging, checkpointing ...
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
