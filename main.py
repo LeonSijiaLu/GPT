@@ -53,10 +53,11 @@ enc = tiktoken.get_encoding("gpt2")
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
 B = 8
 T = 512
-assert total_batch_size % (B * T) == 0, "ensure total_batch_size is divisible by B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size {total_batch_size}")
-print(f"==> calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0, "ensure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size {total_batch_size}")
+    print(f"==> calculated gradient accumulation steps: {grad_accum_steps}")
 
 # tokens = enc.encode("Hello, I am a language model")
 # tokens = torch.tensor(tokens, dtype=torch.long)
@@ -64,12 +65,13 @@ print(f"==> calculated gradient accumulation steps: {grad_accum_steps}")
 
 model = GPT(GPTConfig())
 model.to(device=device)
-# model = torch.compile(model)
-print("worked!")
+model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
 data_dir = os.path.join('data', "tinyshakespeare", "tinyshakespeare.txt")
 
-train_loader = DataLoader(B=B, T=T, file_path=data_dir)
+train_loader = DataLoader(B=B, T=T, process_rank=ddp_rank, num_of_processes=ddp_world_size, file_path=data_dir)
 
 lr_scheduler = LRScheduler(max_lr=3e-4, min_lr=3e-4 * 0.1, warmup_steps=10, max_steps=50)
 
@@ -89,7 +91,14 @@ for i in range(max_steps):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps # scaling down to match `reduction`, there is a `mean` in loss function
         loss_accum += loss.detach()
-        loss.backward()
+        
+        # gradients will be averaged out and synced across all gpus after each backward pass. we don't want that in accumulating gradients,
+        # with the below setup, we only sync in the last loop
+        if ms == grad_accum_steps - 1:
+            loss.backward()
+        else:
+            with model.no_sync():
+                loss.backward()
     
     # to clip the global norm of the gradient at 1.0
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # GPT-3 Paper
