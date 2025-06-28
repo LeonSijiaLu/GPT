@@ -76,6 +76,7 @@ if ddp:
 raw_model = model.module if ddp else model
 
 train_loader = DataLoader(B=B, T=T, process_rank=ddp_rank, num_of_processes=ddp_world_size, split='train')
+val_loader = DataLoader(B=B, T=T, process_rank=ddp_rank, num_of_processes=ddp_world_size, split='val')
 
 # warmup_steps = warmup_tokens / tokens_per_batch = 375M tokens / 2**19 = 715 batches
 # max_steps = total_tokens / tokens_per_batch = 10B / 2**19 = 19073 batches
@@ -85,6 +86,28 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 
 for i in range(max_steps):
     t0 = time.time()
+    
+    if i % 100 == 0:
+        model.eval() # enable validation mode
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            
+            for _ in range(val_loss_steps):
+                x, y = val_loader.get_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+            
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss {val_loss_accum():.4f}")
+    
+    model.train() # enable training mode
     loss_accum = 0.0
     optimizer.zero_grad()
 
@@ -95,7 +118,7 @@ for i in range(max_steps):
         # bfloat16 and tf32 has the same range, just different precision
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
-        loss = loss / grad_accum_steps # scaling down to match `reduction`, there is a `mean` in loss function
+        loss = loss / grad_accum_steps # scaling down to match `reduction`, there is a `mean` in loss function MSE
         loss_accum += loss.detach()
         
         # gradients will be averaged out and synced across all gpus after each backward pass. we don't want that in accumulating gradients,
