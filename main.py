@@ -8,6 +8,7 @@ from model import GPT, GPTConfig
 from lr_scheduler import LRScheduler
 from torch.nn import functional as F
 
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -24,6 +25,10 @@ if ddp:
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device=device)
     master_process = ddp_rank == 0 # master process will do logging, checkpointing ...
+    
+    print(f"ddp_rank:{ddp_rank} started")
+    print(f"ddp_local_rank:{ddp_local_rank} started")
+    print(f"ddp_world_size:{ddp_world_size}")
 else:
     ddp_rank = 0
     ddp_local_rank = 0
@@ -51,8 +56,8 @@ max_steps = 50
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 8
-T = 512
+B = 64
+T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "ensure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -68,14 +73,15 @@ model.to(device=device)
 model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
-data_dir = os.path.join('data', "tinyshakespeare", "tinyshakespeare.txt")
+train_loader = DataLoader(B=B, T=T, process_rank=ddp_rank, num_of_processes=ddp_world_size, split='train')
 
-train_loader = DataLoader(B=B, T=T, process_rank=ddp_rank, num_of_processes=ddp_world_size, file_path=data_dir)
+# warmup_steps = warmup_tokens / tokens_per_batch = 375M tokens / 2**19 = 715 batches
+# max_steps = total_tokens / tokens_per_batch = 10B / 2**19 = 19073 batches
+lr_scheduler = LRScheduler(max_lr=6e-4, min_lr=6e-4 * 0.1, warmup_steps=715, max_steps=19073)
 
-lr_scheduler = LRScheduler(max_lr=3e-4, min_lr=3e-4 * 0.1, warmup_steps=10, max_steps=50)
-
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 for i in range(max_steps):
     t0 = time.time()
@@ -94,11 +100,14 @@ for i in range(max_steps):
         
         # gradients will be averaged out and synced across all gpus after each backward pass. we don't want that in accumulating gradients,
         # with the below setup, we only sync in the last loop
-        if ms == grad_accum_steps - 1:
-            loss.backward()
-        else:
+        if ddp and ms != grad_accum_steps - 1:
             with model.no_sync():
                 loss.backward()
+        else:
+            loss.backward()
+    
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # all-reduce (average out) loss_accum, and distribute on all gpu ranks
     
     # to clip the global norm of the gradient at 1.0
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # GPT-3 Paper
@@ -113,11 +122,14 @@ for i in range(max_steps):
     
     t1 = time.time()
     dts = t1 - t0
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dts
 
-    print(f"step {i}, loss: {loss_accum.item():.6f}, lr: {lr:.4e}, norm: {norm:.4f}, dt:{dts * 1000:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
+    if master_process:
+        print(f"step {i}, loss: {loss_accum.item():.6f}, lr: {lr:.4e}, norm: {norm:.4f}, dt:{dts * 1000:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
 
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0)
 
